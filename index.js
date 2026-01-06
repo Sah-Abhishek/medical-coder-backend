@@ -11,7 +11,7 @@ const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 // Initialize OpenAI
 const openai = new OpenAI({
@@ -24,6 +24,7 @@ const openai = new OpenAI({
 const S3_ENABLED = process.env.S3_ENDPOINT_URL && process.env.S3_ACCESS_KEY && process.env.S3_SECRET_KEY;
 const S3_FOLDER = 'medical-coder';
 const S3_BUCKET = process.env.S3_BUCKET_NAME || 'medextract';
+const S3_ENDPOINT = process.env.S3_ENDPOINT_URL ? process.env.S3_ENDPOINT_URL.replace(/\/$/, '') : null;
 
 let s3Client = null;
 if (S3_ENABLED) {
@@ -37,17 +38,30 @@ if (S3_ENABLED) {
     forcePathStyle: true
   });
   console.log('S3 storage enabled:', process.env.S3_ENDPOINT_URL);
+  console.log('S3 bucket:', S3_BUCKET);
 } else {
   console.log('S3 storage disabled - missing credentials');
+  console.log('S3_ENDPOINT_URL:', process.env.S3_ENDPOINT_URL ? 'SET' : 'NOT SET');
+  console.log('S3_ACCESS_KEY:', process.env.S3_ACCESS_KEY ? 'SET' : 'NOT SET');
+  console.log('S3_SECRET_KEY:', process.env.S3_SECRET_KEY ? 'SET' : 'NOT SET');
 }
 
 /**
  * Generate public URL for S3 object
+ * Returns URL even if S3 is not fully configured (for display purposes)
  */
 function getS3PublicUrl(key) {
-  if (!key || !process.env.S3_ENDPOINT_URL) return null;
-  const endpoint = process.env.S3_ENDPOINT_URL.replace(/\/$/, '');
-  return `${endpoint}/${S3_BUCKET}/${key}`;
+  if (!key) return null;
+
+  // If S3 endpoint is configured, use it
+  if (S3_ENDPOINT) {
+    return `${S3_ENDPOINT}/${S3_BUCKET}/${key}`;
+  }
+
+  // Fallback: return a placeholder URL that indicates the key
+  // This helps with debugging and the frontend can construct the URL if needed
+  console.warn(`S3 URL generation: No endpoint configured for key: ${key}`);
+  return null;
 }
 
 /**
@@ -91,9 +105,9 @@ async function uploadToS3(buffer, key, contentType) {
 }
 
 /**
- * Upload raw document to S3
+ * Upload single raw document to S3
  */
-async function uploadRawFileToS3(documentKey, reportType, rawData, fileType, filename) {
+async function uploadRawFileToS3(documentKey, reportType, rawData, fileType, filename, index = null) {
   if (!rawData) return null;
 
   const contentTypes = {
@@ -108,12 +122,28 @@ async function uploadRawFileToS3(documentKey, reportType, rawData, fileType, fil
     text: '.txt'
   };
 
-  const key = `${documentKey}/${reportType}_document${extensions[fileType] || '.bin'}`;
+  // Add index for multiple files
+  const indexSuffix = index !== null ? `_${index + 1}` : '';
+  const key = `${documentKey}/${reportType}_document${indexSuffix}${extensions[fileType] || '.bin'}`;
   const buffer = fileType === 'text'
     ? Buffer.from(rawData, 'utf-8')
     : Buffer.from(rawData, 'base64');
 
   return await uploadToS3(buffer, key, contentTypes[fileType] || 'application/octet-stream');
+}
+
+/**
+ * Upload multiple raw documents to S3
+ */
+async function uploadMultipleFilesToS3(documentKey, reportType, files) {
+  if (!files || files.length === 0) return [];
+
+  const uploadPromises = files.map((file, index) =>
+    uploadRawFileToS3(documentKey, reportType, file.raw, file.type, file.filename, files.length > 1 ? index : null)
+  );
+
+  const results = await Promise.all(uploadPromises);
+  return results.filter(key => key !== null);
 }
 
 /**
@@ -141,7 +171,7 @@ function getExtension(filename) {
 
 // Initialize PostgreSQL Pool
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/medextract',
+  connectionString: 'postgresql://icd_user:dS8J%26%219E&d5hcz9%238Z@public-primary-pg-innoida-189506-1653768.db.onutho.com:5432/icd',
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
@@ -160,8 +190,12 @@ async function initDatabase() {
         op_text TEXT,
         hp_file_type VARCHAR(20),
         op_file_type VARCHAR(20),
+        hp_file_count INTEGER DEFAULT 1,
+        op_file_count INTEGER DEFAULT 1,
         s3_hp_doc_key VARCHAR(500),
         s3_op_doc_key VARCHAR(500),
+        s3_hp_doc_keys JSONB,
+        s3_op_doc_keys JSONB,
         s3_hp_summary_key VARCHAR(500),
         s3_op_summary_key VARCHAR(500),
         ai_admit_dx VARCHAR(50),
@@ -178,6 +212,7 @@ async function initDatabase() {
         user_modifier VARCHAR(50),
         accuracy_percentage DECIMAL(5,2),
         accuracy_details JSONB,
+        edit_reasons JSONB,
         remarks TEXT,
         status VARCHAR(50) DEFAULT 'pending',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -189,12 +224,17 @@ async function initDatabase() {
     const newColumns = [
       { name: 'hp_file_type', type: 'VARCHAR(20)' },
       { name: 'op_file_type', type: 'VARCHAR(20)' },
+      { name: 'hp_file_count', type: 'INTEGER DEFAULT 1' },
+      { name: 'op_file_count', type: 'INTEGER DEFAULT 1' },
       { name: 's3_hp_doc_key', type: 'VARCHAR(500)' },
       { name: 's3_op_doc_key', type: 'VARCHAR(500)' },
+      { name: 's3_hp_doc_keys', type: 'JSONB' },
+      { name: 's3_op_doc_keys', type: 'JSONB' },
       { name: 's3_hp_summary_key', type: 'VARCHAR(500)' },
       { name: 's3_op_summary_key', type: 'VARCHAR(500)' },
       { name: 'ai_summary_hp', type: 'JSONB' },
-      { name: 'ai_summary_op', type: 'JSONB' }
+      { name: 'ai_summary_op', type: 'JSONB' },
+      { name: 'edit_reasons', type: 'JSONB' }
     ];
 
     for (const col of newColumns) {
@@ -220,7 +260,9 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    s3_enabled: S3_ENABLED
+    s3_enabled: S3_ENABLED,
+    s3_endpoint: S3_ENDPOINT ? 'configured' : 'not configured',
+    s3_bucket: S3_BUCKET
   });
 });
 
@@ -296,28 +338,65 @@ function calculateAccuracy(aiCodes, userCodes) {
 }
 
 /**
+ * Helper to build response with S3 URLs
+ */
+function buildS3Response(s3HpDocKeys, s3OpDocKeys, s3HpSummaryKey, s3OpSummaryKey) {
+  // Ensure arrays
+  const hpKeys = Array.isArray(s3HpDocKeys) ? s3HpDocKeys : (s3HpDocKeys ? [s3HpDocKeys] : []);
+  const opKeys = Array.isArray(s3OpDocKeys) ? s3OpDocKeys : (s3OpDocKeys ? [s3OpDocKeys] : []);
+
+  return {
+    // Keys (for storage/reference)
+    s3_hp_doc_key: hpKeys.length > 0 ? hpKeys[0] : null,
+    s3_op_doc_key: opKeys.length > 0 ? opKeys[0] : null,
+    s3_hp_doc_keys: hpKeys,
+    s3_op_doc_keys: opKeys,
+    s3_hp_summary_key: s3HpSummaryKey,
+    s3_op_summary_key: s3OpSummaryKey,
+
+    // URLs (for display) - single URL for backward compatibility
+    s3_hp_doc_url: hpKeys.length > 0 ? getS3PublicUrl(hpKeys[0]) : null,
+    s3_op_doc_url: opKeys.length > 0 ? getS3PublicUrl(opKeys[0]) : null,
+
+    // URL arrays (for multiple documents)
+    s3_hp_doc_urls: hpKeys.map(key => getS3PublicUrl(key)).filter(Boolean),
+    s3_op_doc_urls: opKeys.map(key => getS3PublicUrl(key)).filter(Boolean),
+
+    // Summary URLs
+    s3_hp_summary_url: getS3PublicUrl(s3HpSummaryKey),
+    s3_op_summary_url: getS3PublicUrl(s3OpSummaryKey),
+
+    // S3 config info (helps frontend construct URLs if needed)
+    s3_endpoint: S3_ENDPOINT,
+    s3_bucket: S3_BUCKET
+  };
+}
+
+/**
  * Test endpoint with hardcoded data
  */
 app.post('/extract-codes-test', async (req, res) => {
   const {
     hp_text, op_text,
-    hp_raw, hp_type, hp_filename,
-    op_raw, op_type, op_filename,
-    upload_documents = true  // Toggle for document upload
+    hp_files, op_files,
+    hp_type, op_type,
+    upload_documents = true
   } = req.body;
 
   const documentKey = uuidv4();
 
-  // Upload documents to S3 (if toggle is enabled)
-  let s3HpDocKey = null;
-  let s3OpDocKey = null;
+  // Upload multiple documents to S3 (if toggle is enabled)
+  let s3HpDocKeys = [];
+  let s3OpDocKeys = [];
 
   if (upload_documents) {
-    if (hp_raw && hp_type) {
-      s3HpDocKey = await uploadRawFileToS3(documentKey, 'hp', hp_raw, hp_type, hp_filename);
+    if (hp_files && hp_files.length > 0) {
+      s3HpDocKeys = await uploadMultipleFilesToS3(documentKey, 'hp', hp_files);
+      console.log('Uploaded HP files:', s3HpDocKeys);
     }
-    if (op_raw && op_type) {
-      s3OpDocKey = await uploadRawFileToS3(documentKey, 'op', op_raw, op_type, op_filename);
+    if (op_files && op_files.length > 0) {
+      s3OpDocKeys = await uploadMultipleFilesToS3(documentKey, 'op', op_files);
+      console.log('Uploaded OP files:', s3OpDocKeys);
     }
   }
 
@@ -347,12 +426,18 @@ app.post('/extract-codes-test', async (req, res) => {
     complications: "None",
     estimated_blood_loss: "Minimal",
     disposition: "Patient tolerated procedure well",
-    recommendations: ["Follow up pathology in 1 week", "Repeat colonoscopy in 3 years"]
+    recommendations: [
+      { recommendation: "Follow up pathology in 1 week" },
+      { recommendation: "Repeat colonoscopy in 3 years" }
+    ]
   };
 
   // ALWAYS upload AI summaries to S3
   const s3HpSummaryKey = await uploadSummaryToS3(documentKey, 'hp', hpSummary);
   const s3OpSummaryKey = await uploadSummaryToS3(documentKey, 'op', opSummary);
+
+  // Build S3 response with all URLs
+  const s3Response = buildS3Response(s3HpDocKeys, s3OpDocKeys, s3HpSummaryKey, s3OpSummaryKey);
 
   const extracted = {
     document_key: documentKey,
@@ -366,32 +451,42 @@ app.post('/extract-codes-test', async (req, res) => {
     tokens_used: 0,
     mr_number: "M000251535",
     acct_number: "ACC-2024-09162",
-    hp_file_type: hp_type || 'text',
-    op_file_type: op_type || 'text',
-    s3_hp_doc_key: s3HpDocKey,
-    s3_op_doc_key: s3OpDocKey,
-    s3_hp_summary_key: s3HpSummaryKey,
-    s3_op_summary_key: s3OpSummaryKey,
-    s3_hp_doc_url: getS3PublicUrl(s3HpDocKey),
-    s3_op_doc_url: getS3PublicUrl(s3OpDocKey),
-    s3_hp_summary_url: getS3PublicUrl(s3HpSummaryKey),
-    s3_op_summary_url: getS3PublicUrl(s3OpSummaryKey)
+    hp_file_type: hp_type || (hp_files?.length > 1 ? 'multi-image' : 'image'),
+    op_file_type: op_type || (op_files?.length > 1 ? 'multi-image' : 'image'),
+    hp_file_count: hp_files?.length || 0,
+    op_file_count: op_files?.length || 0,
+    ...s3Response
   };
+
+  // Log what we're returning
+  console.log('Returning extracted data with S3 URLs:', {
+    hp_file_count: extracted.hp_file_count,
+    op_file_count: extracted.op_file_count,
+    s3_hp_doc_url: extracted.s3_hp_doc_url,
+    s3_hp_doc_urls: extracted.s3_hp_doc_urls,
+    s3_op_doc_url: extracted.s3_op_doc_url,
+    s3_op_doc_urls: extracted.s3_op_doc_urls
+  });
 
   try {
     await pool.query(`
       INSERT INTO extractions (
         document_key, mr_number, acct_number, chart_number, dos,
         hp_text, op_text, hp_file_type, op_file_type,
-        s3_hp_doc_key, s3_op_doc_key, s3_hp_summary_key, s3_op_summary_key,
+        hp_file_count, op_file_count,
+        s3_hp_doc_key, s3_op_doc_key,
+        s3_hp_doc_keys, s3_op_doc_keys, s3_hp_summary_key, s3_op_summary_key,
         ai_admit_dx, ai_pdx, ai_sdx, ai_cpt, ai_modifier,
         ai_summary_hp, ai_summary_op, status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
       ON CONFLICT (document_key) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
     `, [
       documentKey, extracted.mr_number, extracted.acct_number, extracted.chart_number, extracted.dos,
-      hp_text, op_text, hp_type || 'text', op_type || 'text',
-      s3HpDocKey, s3OpDocKey, s3HpSummaryKey, s3OpSummaryKey,
+      hp_text, op_text, extracted.hp_file_type, extracted.op_file_type,
+      hp_files?.length || 0, op_files?.length || 0,
+      s3HpDocKeys.length > 0 ? s3HpDocKeys[0] : null,
+      s3OpDocKeys.length > 0 ? s3OpDocKeys[0] : null,
+      JSON.stringify(s3HpDocKeys), JSON.stringify(s3OpDocKeys), s3HpSummaryKey, s3OpSummaryKey,
       extracted.admit_dx, extracted.pdx, JSON.stringify(extracted.sdx), JSON.stringify(extracted.cpt),
       extracted.modifier, JSON.stringify(hpSummary), JSON.stringify(opSummary), 'pending'
     ]);
@@ -404,6 +499,22 @@ app.post('/extract-codes-test', async (req, res) => {
     extracted,
     ai_summary: { hp: hpSummary, op: opSummary }
   });
+
+  // Log the full response being sent
+  console.log('\n>>>>>> TEST ENDPOINT - FULL RESPONSE SENT <<<<<<');
+  console.log(JSON.stringify({
+    s3_hp_doc_url: extracted.s3_hp_doc_url,
+    s3_hp_doc_urls: extracted.s3_hp_doc_urls,
+    s3_op_doc_url: extracted.s3_op_doc_url,
+    s3_op_doc_urls: extracted.s3_op_doc_urls,
+    s3_hp_doc_key: extracted.s3_hp_doc_key,
+    s3_hp_doc_keys: extracted.s3_hp_doc_keys,
+    s3_endpoint: extracted.s3_endpoint,
+    s3_bucket: extracted.s3_bucket,
+    hp_file_count: extracted.hp_file_count,
+    op_file_count: extracted.op_file_count
+  }, null, 2));
+  console.log('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n');
 });
 
 /**
@@ -413,9 +524,9 @@ app.post('/extract-codes', async (req, res) => {
   try {
     const {
       hp_text, op_text, chart_number,
-      hp_raw, hp_type, hp_filename,
-      op_raw, op_type, op_filename,
-      upload_documents = true  // Toggle for document upload
+      hp_files, op_files,
+      hp_type, op_type,
+      upload_documents = true
     } = req.body;
 
     if (!hp_text && !op_text) {
@@ -424,16 +535,18 @@ app.post('/extract-codes', async (req, res) => {
 
     const documentKey = uuidv4();
 
-    // Upload documents to S3 (if toggle is enabled)
-    let s3HpDocKey = null;
-    let s3OpDocKey = null;
+    // Upload multiple documents to S3 (if toggle is enabled)
+    let s3HpDocKeys = [];
+    let s3OpDocKeys = [];
 
     if (upload_documents) {
-      if (hp_raw && hp_type) {
-        s3HpDocKey = await uploadRawFileToS3(documentKey, 'hp', hp_raw, hp_type, hp_filename);
+      if (hp_files && hp_files.length > 0) {
+        s3HpDocKeys = await uploadMultipleFilesToS3(documentKey, 'hp', hp_files);
+        console.log('Uploaded HP files:', s3HpDocKeys);
       }
-      if (op_raw && op_type) {
-        s3OpDocKey = await uploadRawFileToS3(documentKey, 'op', op_raw, op_type, op_filename);
+      if (op_files && op_files.length > 0) {
+        s3OpDocKeys = await uploadMultipleFilesToS3(documentKey, 'op', op_files);
+        console.log('Uploaded OP files:', s3OpDocKeys);
       }
     }
 
@@ -467,36 +580,54 @@ app.post('/extract-codes', async (req, res) => {
     const s3HpSummaryKey = await uploadSummaryToS3(documentKey, 'hp', hpSummary);
     const s3OpSummaryKey = await uploadSummaryToS3(documentKey, 'op', opSummary);
 
+    // Build S3 response with all URLs
+    const s3Response = buildS3Response(s3HpDocKeys, s3OpDocKeys, s3HpSummaryKey, s3OpSummaryKey);
+
     const extracted = {
       ...codesResult,
       document_key: documentKey,
       mr_number: mrNumber,
       acct_number: acctNumber,
-      hp_file_type: hp_type || 'text',
-      op_file_type: op_type || 'text',
-      s3_hp_doc_key: s3HpDocKey,
-      s3_op_doc_key: s3OpDocKey,
-      s3_hp_summary_key: s3HpSummaryKey,
-      s3_op_summary_key: s3OpSummaryKey,
-      s3_hp_doc_url: getS3PublicUrl(s3HpDocKey),
-      s3_op_doc_url: getS3PublicUrl(s3OpDocKey),
-      s3_hp_summary_url: getS3PublicUrl(s3HpSummaryKey),
-      s3_op_summary_url: getS3PublicUrl(s3OpSummaryKey)
+      hp_file_type: hp_type || (hp_files?.length > 1 ? 'multi-image' : hp_files?.length === 1 ? 'image' : 'text'),
+      op_file_type: op_type || (op_files?.length > 1 ? 'multi-image' : op_files?.length === 1 ? 'image' : 'text'),
+      hp_file_count: hp_files?.length || 0,
+      op_file_count: op_files?.length || 0,
+      ...s3Response
     };
+
+    // Log what we're returning - DETAILED
+    console.log('\n========== EXTRACT CODES RESPONSE ==========');
+    console.log('Document Key:', documentKey);
+    console.log('S3 Enabled:', S3_ENABLED);
+    console.log('S3 Endpoint:', S3_ENDPOINT);
+    console.log('S3 Bucket:', S3_BUCKET);
+    console.log('HP Files Uploaded:', s3HpDocKeys);
+    console.log('OP Files Uploaded:', s3OpDocKeys);
+    console.log('HP Doc URL:', extracted.s3_hp_doc_url);
+    console.log('HP Doc URLs:', extracted.s3_hp_doc_urls);
+    console.log('OP Doc URL:', extracted.s3_op_doc_url);
+    console.log('OP Doc URLs:', extracted.s3_op_doc_urls);
+    console.log('File Counts - HP:', extracted.hp_file_count, 'OP:', extracted.op_file_count);
+    console.log('=============================================\n');
 
     try {
       await pool.query(`
         INSERT INTO extractions (
           document_key, mr_number, acct_number, chart_number, dos,
           hp_text, op_text, hp_file_type, op_file_type,
-          s3_hp_doc_key, s3_op_doc_key, s3_hp_summary_key, s3_op_summary_key,
+          hp_file_count, op_file_count,
+          s3_hp_doc_key, s3_op_doc_key,
+          s3_hp_doc_keys, s3_op_doc_keys, s3_hp_summary_key, s3_op_summary_key,
           ai_admit_dx, ai_pdx, ai_sdx, ai_cpt, ai_modifier,
           ai_summary_hp, ai_summary_op, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
       `, [
         documentKey, mrNumber, acctNumber, extractedChartNumber, codesResult.dos,
-        hp_text, op_text, hp_type || 'text', op_type || 'text',
-        s3HpDocKey, s3OpDocKey, s3HpSummaryKey, s3OpSummaryKey,
+        hp_text, op_text, extracted.hp_file_type, extracted.op_file_type,
+        hp_files?.length || 0, op_files?.length || 0,
+        s3HpDocKeys.length > 0 ? s3HpDocKeys[0] : null,
+        s3OpDocKeys.length > 0 ? s3OpDocKeys[0] : null,
+        JSON.stringify(s3HpDocKeys), JSON.stringify(s3OpDocKeys), s3HpSummaryKey, s3OpSummaryKey,
         codesResult.admit_dx, codesResult.pdx,
         JSON.stringify(codesResult.sdx), JSON.stringify(codesResult.cpt),
         codesResult.modifier, JSON.stringify(hpSummary), JSON.stringify(opSummary), 'pending'
@@ -511,6 +642,22 @@ app.post('/extract-codes', async (req, res) => {
       ai_summary: { hp: hpSummary, op: opSummary }
     });
 
+    // Log the full response being sent
+    console.log('\n>>>>>> FULL RESPONSE SENT TO FRONTEND <<<<<<');
+    console.log(JSON.stringify({
+      s3_hp_doc_url: extracted.s3_hp_doc_url,
+      s3_hp_doc_urls: extracted.s3_hp_doc_urls,
+      s3_op_doc_url: extracted.s3_op_doc_url,
+      s3_op_doc_urls: extracted.s3_op_doc_urls,
+      s3_hp_doc_key: extracted.s3_hp_doc_key,
+      s3_hp_doc_keys: extracted.s3_hp_doc_keys,
+      s3_endpoint: extracted.s3_endpoint,
+      s3_bucket: extracted.s3_bucket,
+      hp_file_count: extracted.hp_file_count,
+      op_file_count: extracted.op_file_count
+    }, null, 2));
+    console.log('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n');
+
   } catch (error) {
     console.error('Extract codes error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -522,7 +669,7 @@ app.post('/extract-codes', async (req, res) => {
  */
 app.post('/submit-corrections', async (req, res) => {
   try {
-    const { document_key, chart_number, original, corrected, remarks } = req.body;
+    const { document_key, chart_number, original, corrected, edit_reasons, remarks } = req.body;
 
     if (!document_key || !corrected) {
       return res.status(400).json({ success: false, error: 'document_key and corrected data are required' });
@@ -534,13 +681,13 @@ app.post('/submit-corrections', async (req, res) => {
       await pool.query(`
         UPDATE extractions SET
           user_admit_dx = $1, user_pdx = $2, user_sdx = $3, user_cpt = $4, user_modifier = $5,
-          accuracy_percentage = $6, accuracy_details = $7, remarks = $8,
+          accuracy_percentage = $6, accuracy_details = $7, edit_reasons = $8, remarks = $9,
           status = 'completed', updated_at = CURRENT_TIMESTAMP
-        WHERE document_key = $9
+        WHERE document_key = $10
       `, [
         corrected.admit_dx, corrected.pdx, JSON.stringify(corrected.sdx), JSON.stringify(corrected.cpt),
         corrected.modifier, accuracyResult.percentage, JSON.stringify(accuracyResult.details),
-        remarks, document_key
+        JSON.stringify(edit_reasons), remarks, document_key
       ]);
     } catch (dbError) {
       console.error('Database update error:', dbError);
@@ -568,11 +715,13 @@ app.get('/analytics', async (req, res) => {
     const result = await pool.query(`
       SELECT id, document_key, mr_number, acct_number, chart_number, dos,
         hp_text, op_text, hp_file_type, op_file_type,
-        s3_hp_doc_key, s3_op_doc_key, s3_hp_summary_key, s3_op_summary_key,
+        hp_file_count, op_file_count,
+        s3_hp_doc_key, s3_op_doc_key,
+        s3_hp_doc_keys, s3_op_doc_keys, s3_hp_summary_key, s3_op_summary_key,
         ai_admit_dx, ai_pdx, ai_sdx, ai_cpt, ai_modifier,
         ai_summary_hp, ai_summary_op,
         user_admit_dx, user_pdx, user_sdx, user_cpt, user_modifier,
-        accuracy_percentage, accuracy_details, remarks, status, created_at, updated_at
+        accuracy_percentage, accuracy_details, edit_reasons, remarks, status, created_at, updated_at
       FROM extractions WHERE status = 'completed' ORDER BY updated_at DESC LIMIT 100
     `);
 
@@ -582,16 +731,30 @@ app.get('/analytics', async (req, res) => {
       ? completedRecords.reduce((sum, r) => sum + (parseFloat(r.accuracy_percentage) || 0), 0) / totalRecords
       : 0;
 
-    const records = await Promise.all(completedRecords.map(async r => {
+    const records = completedRecords.map(r => {
       let aiSdx = r.ai_sdx;
       let aiCpt = r.ai_cpt;
       let userSdx = r.user_sdx;
       let userCpt = r.user_cpt;
+      let s3HpDocKeys = r.s3_hp_doc_keys;
+      let s3OpDocKeys = r.s3_op_doc_keys;
 
       if (typeof aiSdx === 'string') try { aiSdx = JSON.parse(aiSdx); } catch { aiSdx = []; }
       if (typeof aiCpt === 'string') try { aiCpt = JSON.parse(aiCpt); } catch { aiCpt = []; }
       if (typeof userSdx === 'string') try { userSdx = JSON.parse(userSdx); } catch { userSdx = []; }
       if (typeof userCpt === 'string') try { userCpt = JSON.parse(userCpt); } catch { userCpt = []; }
+      if (typeof s3HpDocKeys === 'string') try { s3HpDocKeys = JSON.parse(s3HpDocKeys); } catch { s3HpDocKeys = []; }
+      if (typeof s3OpDocKeys === 'string') try { s3OpDocKeys = JSON.parse(s3OpDocKeys); } catch { s3OpDocKeys = []; }
+
+      // Handle both singular key and array of keys
+      if (!s3HpDocKeys || s3HpDocKeys.length === 0) {
+        s3HpDocKeys = r.s3_hp_doc_key ? [r.s3_hp_doc_key] : [];
+      }
+      if (!s3OpDocKeys || s3OpDocKeys.length === 0) {
+        s3OpDocKeys = r.s3_op_doc_key ? [r.s3_op_doc_key] : [];
+      }
+
+      const s3Response = buildS3Response(s3HpDocKeys, s3OpDocKeys, r.s3_hp_summary_key, r.s3_op_summary_key);
 
       return {
         ...r,
@@ -600,13 +763,10 @@ app.get('/analytics', async (req, res) => {
         user_sdx: userSdx || [],
         user_cpt: userCpt || [],
         accuracy_details: r.accuracy_details || {},
-        // Add S3 URLs
-        s3_hp_doc_url: getS3PublicUrl(r.s3_hp_doc_key),
-        s3_op_doc_url: getS3PublicUrl(r.s3_op_doc_key),
-        s3_hp_summary_url: getS3PublicUrl(r.s3_hp_summary_key),
-        s3_op_summary_url: getS3PublicUrl(r.s3_op_summary_key)
+        edit_reasons: r.edit_reasons || {},
+        ...s3Response
       };
-    }));
+    });
 
     res.json({
       success: true,
@@ -642,11 +802,25 @@ app.get('/extraction/:documentKey', async (req, res) => {
     let aiCpt = record.ai_cpt;
     let userSdx = record.user_sdx;
     let userCpt = record.user_cpt;
+    let s3HpDocKeys = record.s3_hp_doc_keys;
+    let s3OpDocKeys = record.s3_op_doc_keys;
 
     if (typeof aiSdx === 'string') try { aiSdx = JSON.parse(aiSdx); } catch { aiSdx = []; }
     if (typeof aiCpt === 'string') try { aiCpt = JSON.parse(aiCpt); } catch { aiCpt = []; }
     if (typeof userSdx === 'string') try { userSdx = JSON.parse(userSdx); } catch { userSdx = []; }
     if (typeof userCpt === 'string') try { userCpt = JSON.parse(userCpt); } catch { userCpt = []; }
+    if (typeof s3HpDocKeys === 'string') try { s3HpDocKeys = JSON.parse(s3HpDocKeys); } catch { s3HpDocKeys = []; }
+    if (typeof s3OpDocKeys === 'string') try { s3OpDocKeys = JSON.parse(s3OpDocKeys); } catch { s3OpDocKeys = []; }
+
+    // Handle both singular key and array of keys
+    if (!s3HpDocKeys || s3HpDocKeys.length === 0) {
+      s3HpDocKeys = record.s3_hp_doc_key ? [record.s3_hp_doc_key] : [];
+    }
+    if (!s3OpDocKeys || s3OpDocKeys.length === 0) {
+      s3OpDocKeys = record.s3_op_doc_key ? [record.s3_op_doc_key] : [];
+    }
+
+    const s3Response = buildS3Response(s3HpDocKeys, s3OpDocKeys, record.s3_hp_summary_key, record.s3_op_summary_key);
 
     res.json({
       success: true,
@@ -657,10 +831,8 @@ app.get('/extraction/:documentKey', async (req, res) => {
         user_sdx: userSdx || [],
         user_cpt: userCpt || [],
         accuracy_details: record.accuracy_details || {},
-        s3_hp_doc_url: getS3PublicUrl(record.s3_hp_doc_key),
-        s3_op_doc_url: getS3PublicUrl(record.s3_op_doc_key),
-        s3_hp_summary_url: getS3PublicUrl(record.s3_hp_summary_key),
-        s3_op_summary_url: getS3PublicUrl(record.s3_op_summary_key)
+        edit_reasons: record.edit_reasons || {},
+        ...s3Response
       }
     });
 
@@ -755,7 +927,12 @@ function extractDateOfService(text) {
   return '';
 }
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Medical Coding API running on port ${PORT}`));
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, () => {
+  console.log(`Medical Coding API running on port ${PORT}`);
+  console.log(`S3 Enabled: ${S3_ENABLED}`);
+  console.log(`S3 Endpoint: ${S3_ENDPOINT || 'NOT CONFIGURED'}`);
+  console.log(`S3 Bucket: ${S3_BUCKET}`);
+});
 
 module.exports = app;
